@@ -1,0 +1,555 @@
+name: APK bauen
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Quellcode anlegen
+        run: |
+          mkdir -p src && cd src
+          mkdir -p '.'
+          cat > 'gradle.properties' <<'EOF_X'
+          org.gradle.jvmargs=-Xmx2g
+          EOF_X
+          mkdir -p '.'
+          cat > 'settings.gradle' <<'EOF_X'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "FireUpdater"
+          include ':app'
+          EOF_X
+          mkdir -p 'app'
+          cat > 'app/build.gradle' <<'EOF_X'
+          plugins { id 'com.android.application' version '8.5.2' }
+
+          android {
+              namespace 'de.flori.updater'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'de.flori.updater'
+                  minSdk 22
+                  targetSdk 30
+                  versionCode 1
+                  versionName '1.0'
+              }
+              signingConfigs {
+                  release {
+                      storeFile file('updater.jks')
+                      storePassword 'updater123'
+                      keyAlias 'updater'
+                      keyPassword 'updater123'
+                  }
+              }
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                      signingConfig signingConfigs.release
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_1_8
+                  targetCompatibility JavaVersion.VERSION_1_8
+              }
+              lint { checkReleaseBuilds false; abortOnError false }
+          }
+          EOF_X
+          mkdir -p 'app/src/main'
+          cat > 'app/src/main/AndroidManifest.xml' <<'EOF_X'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+              <uses-feature android:name="android.software.leanback" android:required="false" />
+              <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+              <queries>
+                  <package android:name="com.spocky.projengmenu" />
+                  <package android:name="org.smarttube.stable" />
+              </queries>
+              <application
+                  android:label="Updater"
+                  android:icon="@drawable/ic_launcher"
+                  android:banner="@drawable/banner"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true"
+                      android:screenOrientation="landscape">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                          <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <receiver android:name=".InstallReceiver" android:exported="false" />
+              </application>
+          </manifest>
+          EOF_X
+          mkdir -p 'app/src/main/java/de/flori/updater'
+          cat > 'app/src/main/java/de/flori/updater/InstallReceiver.java' <<'EOF_X'
+          package de.flori.updater;
+
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.pm.PackageInstaller;
+          import android.widget.Toast;
+
+          public class InstallReceiver extends BroadcastReceiver {
+              @Override
+              public void onReceive(Context ctx, Intent intent) {
+                  int status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE);
+                  if (status == PackageInstaller.STATUS_PENDING_USER_ACTION) {
+                      Intent confirm = intent.getParcelableExtra(Intent.EXTRA_INTENT);
+                      if (confirm != null) {
+                          confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                          ctx.startActivity(confirm);
+                      }
+                  } else if (status == PackageInstaller.STATUS_SUCCESS) {
+                      Toast.makeText(ctx, "Update installiert", Toast.LENGTH_SHORT).show();
+                  } else {
+                      String msg = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE);
+                      Toast.makeText(ctx, "Installation fehlgeschlagen: " + msg, Toast.LENGTH_LONG).show();
+                  }
+              }
+          }
+          EOF_X
+          mkdir -p 'app/src/main/java/de/flori/updater'
+          cat > 'app/src/main/java/de/flori/updater/MainActivity.java' <<'EOF_X'
+          package de.flori.updater;
+
+          import android.app.Activity;
+          import android.app.PendingIntent;
+          import android.content.Intent;
+          import android.content.pm.PackageInfo;
+          import android.content.pm.PackageInstaller;
+          import android.graphics.drawable.GradientDrawable;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.provider.Settings;
+          import android.view.View;
+          import android.widget.TextView;
+
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+
+          import java.io.ByteArrayOutputStream;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.text.SimpleDateFormat;
+          import java.util.ArrayDeque;
+          import java.util.Date;
+          import java.util.Locale;
+          import java.util.regex.Matcher;
+          import java.util.regex.Pattern;
+
+          public class MainActivity extends Activity {
+
+              static class App {
+                  final String name, pkg, repo, apkMatch;
+                  String installed, latest, apkUrl;
+                  boolean updateAvailable;
+                  TextView tvVersion, tvStatus;
+                  App(String name, String pkg, String repo, String apkMatch) {
+                      this.name = name; this.pkg = pkg; this.repo = repo; this.apkMatch = apkMatch;
+                  }
+              }
+
+              private final App[] apps = {
+                      new App("Projectivy", "com.spocky.projengmenu", "spocky/miproja1", ".apk"),
+                      new App("SmartTube", "org.smarttube.stable", "yuliskov/SmartTube", "universal.apk")
+              };
+
+              private final Handler ui = new Handler(Looper.getMainLooper());
+              private final ArrayDeque<App> queue = new ArrayDeque<>();
+              private boolean waitingForInstall = false;
+              private boolean pausedSinceCommit = false;
+              private TextView lastCheck, hint;
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  setContentView(R.layout.activity_main);
+                  lastCheck = findViewById(R.id.lastCheck);
+                  hint = findViewById(R.id.hint);
+
+                  int[] tileIds = {R.id.tile0, R.id.tile1};
+                  for (int i = 0; i < apps.length; i++) {
+                      final App a = apps[i];
+                      View tile = findViewById(tileIds[i]);
+                      ((TextView) tile.findViewById(R.id.name)).setText(a.name);
+                      a.tvVersion = tile.findViewById(R.id.version);
+                      a.tvStatus = tile.findViewById(R.id.status);
+                      tile.setOnClickListener(v -> startUpdates(a));
+                  }
+                  findViewById(R.id.btnAll).setOnClickListener(v -> startUpdates(null));
+                  findViewById(R.id.btnCheck).setOnClickListener(v -> check());
+                  findViewById(R.id.btnAll).requestFocus();
+                  check();
+              }
+
+              @Override
+              protected void onPause() {
+                  super.onPause();
+                  if (waitingForInstall) pausedSinceCommit = true;
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  if (waitingForInstall && pausedSinceCommit) {
+                      waitingForInstall = false;
+                      pausedSinceCommit = false;
+                      ui.postDelayed(() -> {
+                          check();
+                          installNext();
+                      }, 1500);
+                  }
+              }
+
+              // ---------- Versionen prüfen ----------
+
+              private void check() {
+                  hideHint();
+                  for (App a : apps) {
+                      a.installed = installedVersion(a.pkg);
+                      a.tvVersion.setText(a.installed == null ? "Nicht installiert" : a.installed);
+                      setStatus(a, "Prüfe …", 0xFF2C2F36, 0xFFB4B2A9);
+                      new Thread(() -> fetchLatest(a)).start();
+                  }
+                  lastCheck.setText("Zuletzt geprüft " + new SimpleDateFormat("HH:mm", Locale.GERMANY).format(new Date()));
+              }
+
+              private String installedVersion(String pkg) {
+                  try {
+                      PackageInfo pi = getPackageManager().getPackageInfo(pkg, 0);
+                      return pi.versionName;
+                  } catch (Exception e) {
+                      return null;
+                  }
+              }
+
+              private void fetchLatest(App a) {
+                  try {
+                      JSONObject rel = new JSONObject(httpGet("https://api.github.com/repos/" + a.repo + "/releases/latest"));
+                      String tag = rel.optString("tag_name", "");
+                      JSONArray assets = rel.getJSONArray("assets");
+                      String url = null;
+                      for (int i = 0; i < assets.length(); i++) {
+                          JSONObject as = assets.getJSONObject(i);
+                          String n = as.getString("name");
+                          if (n.endsWith(".apk") && n.endsWith(a.apkMatch)) {
+                              url = as.getString("browser_download_url");
+                              break;
+                          }
+                      }
+                      a.latest = cleanVersion(tag);
+                      a.apkUrl = url;
+                      ui.post(() -> showResult(a));
+                  } catch (Exception e) {
+                      ui.post(() -> setStatus(a, "Keine Verbindung", 0xFFFCEBEB, 0xFF791F1F));
+                  }
+              }
+
+              private void showResult(App a) {
+                  String inst = a.installed == null ? "–" : a.installed;
+                  if (a.latest != null) a.tvVersion.setText(inst + "  →  " + a.latest);
+                  if (a.apkUrl == null) {
+                      a.updateAvailable = false;
+                      setStatus(a, "Keine APK gefunden", 0xFFFCEBEB, 0xFF791F1F);
+                  } else if (a.installed == null) {
+                      a.updateAvailable = true;
+                      setStatus(a, "Installieren", 0xFFFAEEDA, 0xFF633806);
+                  } else if (a.latest != null && compare(a.latest, cleanVersion(a.installed)) > 0) {
+                      a.updateAvailable = true;
+                      setStatus(a, "Update da", 0xFFFAEEDA, 0xFF633806);
+                  } else {
+                      a.updateAvailable = false;
+                      a.tvVersion.setText(inst);
+                      setStatus(a, "Aktuell", 0xFFEAF3DE, 0xFF27500A);
+                  }
+              }
+
+              // ---------- Installieren ----------
+
+              private void startUpdates(App only) {
+                  if (Build.VERSION.SDK_INT >= 26 && !getPackageManager().canRequestPackageInstalls()) {
+                      showHint("Bitte erlaube „Updater“, Apps zu installieren. Danach zurück und nochmal drücken.");
+                      try {
+                          startActivity(new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                                  Uri.parse("package:" + getPackageName())));
+                      } catch (Exception e) {
+                          showHint("Einstellungen › Mein Fire TV › Entwickleroptionen › Apps unbekannter Herkunft › Updater einschalten.");
+                      }
+                      return;
+                  }
+                  queue.clear();
+                  for (App a : apps) {
+                      if (only == null ? a.updateAvailable : a == only && a.apkUrl != null) queue.add(a);
+                  }
+                  if (queue.isEmpty()) {
+                      showHint(only == null ? "Alles ist aktuell." : "Für " + only.name + " gibt es nichts zu installieren.");
+                      return;
+                  }
+                  installNext();
+              }
+
+              private void installNext() {
+                  App a = queue.poll();
+                  if (a == null) return;
+                  setStatus(a, "Lädt …", 0xFFE6F1FB, 0xFF0C447C);
+                  new Thread(() -> download(a)).start();
+              }
+
+              private void download(App a) {
+                  try {
+                      PackageInstaller pi = getPackageManager().getPackageInstaller();
+                      PackageInstaller.SessionParams params =
+                              new PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL);
+                      params.setAppPackageName(a.pkg);
+                      int id = pi.createSession(params);
+                      PackageInstaller.Session session = pi.openSession(id);
+
+                      HttpURLConnection c = open(a.apkUrl);
+                      int total = c.getContentLength();
+                      try (InputStream in = c.getInputStream();
+                           OutputStream out = session.openWrite("app.apk", 0, total > 0 ? total : -1)) {
+                          byte[] buf = new byte[65536];
+                          long done = 0;
+                          int n, lastPct = -1;
+                          while ((n = in.read(buf)) > 0) {
+                              out.write(buf, 0, n);
+                              done += n;
+                              if (total > 0) {
+                                  int pct = (int) (done * 100 / total);
+                                  if (pct != lastPct) {
+                                      lastPct = pct;
+                                      ui.post(() -> setStatus(a, "Lädt " + pct + " %", 0xFFE6F1FB, 0xFF0C447C));
+                                  }
+                              }
+                          }
+                          session.fsync(out);
+                      }
+
+                      int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+                      if (Build.VERSION.SDK_INT >= 31) flags |= PendingIntent.FLAG_MUTABLE;
+                      PendingIntent p = PendingIntent.getBroadcast(this, id,
+                              new Intent(this, InstallReceiver.class), flags);
+                      ui.post(() -> {
+                          setStatus(a, "Bitte bestätigen", 0xFFE6F1FB, 0xFF0C447C);
+                          waitingForInstall = true;
+                          pausedSinceCommit = false;
+                      });
+                      session.commit(p.getIntentSender());
+                      session.close();
+                  } catch (Exception e) {
+                      ui.post(() -> {
+                          setStatus(a, "Fehler beim Laden", 0xFFFCEBEB, 0xFF791F1F);
+                          installNext();
+                      });
+                  }
+              }
+
+              // ---------- Hilfsfunktionen ----------
+
+              private HttpURLConnection open(String url) throws Exception {
+                  HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+                  c.setRequestProperty("User-Agent", "FireUpdater");
+                  c.setConnectTimeout(15000);
+                  c.setReadTimeout(30000);
+                  c.setInstanceFollowRedirects(true);
+                  return c;
+              }
+
+              private String httpGet(String url) throws Exception {
+                  HttpURLConnection c = open(url);
+                  c.setRequestProperty("Accept", "application/vnd.github+json");
+                  try (InputStream in = c.getInputStream()) {
+                      ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                      byte[] buf = new byte[8192];
+                      int n;
+                      while ((n = in.read(buf)) > 0) bo.write(buf, 0, n);
+                      return bo.toString("UTF-8");
+                  }
+              }
+
+              private static String cleanVersion(String v) {
+                  if (v == null) return null;
+                  Matcher m = Pattern.compile("\\d+(\\.\\d+)*").matcher(v);
+                  return m.find() ? m.group() : null;
+              }
+
+              private static int compare(String x, String y) {
+                  if (y == null) return 1;
+                  String[] a = x.split("\\."), b = y.split("\\.");
+                  for (int i = 0; i < Math.max(a.length, b.length); i++) {
+                      long p = i < a.length ? Long.parseLong(a[i]) : 0;
+                      long q = i < b.length ? Long.parseLong(b[i]) : 0;
+                      if (p != q) return p > q ? 1 : -1;
+                  }
+                  return 0;
+              }
+
+              private void setStatus(App a, String text, int bg, int fg) {
+                  a.tvStatus.setText(text);
+                  a.tvStatus.setTextColor(fg);
+                  GradientDrawable d = new GradientDrawable();
+                  d.setColor(bg);
+                  d.setCornerRadius(12 * getResources().getDisplayMetrics().density);
+                  a.tvStatus.setBackground(d);
+              }
+
+              private void showHint(String t) {
+                  hint.setText(t);
+                  hint.setVisibility(View.VISIBLE);
+              }
+
+              private void hideHint() {
+                  hint.setVisibility(View.GONE);
+              }
+          }
+          EOF_X
+          mkdir -p 'app/src/main/res/values'
+          cat > 'app/src/main/res/values/colors.xml' <<'EOF_X'
+          <resources>
+              <color name="bg">#14161A</color>
+              <color name="tile">#22252B</color>
+              <color name="text">#F1EFE8</color>
+              <color name="muted">#B4B2A9</color>
+              <color name="accent">#378ADD</color>
+          </resources>
+          EOF_X
+          mkdir -p 'app/src/main/res/layout'
+          cat > 'app/src/main/res/layout/activity_main.xml' <<'EOF_X'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent" android:layout_height="match_parent"
+              android:orientation="vertical" android:background="@color/bg" android:padding="48dp">
+
+              <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                  android:orientation="horizontal" android:gravity="center_vertical">
+                  <TextView android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content"
+                      android:text="Updater" android:textColor="@color/text" android:textSize="32sp" android:textStyle="bold" />
+                  <TextView android:id="@+id/lastCheck" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                      android:textColor="@color/muted" android:textSize="18sp" />
+              </LinearLayout>
+
+              <LinearLayout android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1"
+                  android:orientation="horizontal" android:layout_marginTop="32dp" android:layout_marginBottom="32dp">
+                  <include android:id="@+id/tile0" layout="@layout/tile"
+                      android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1"
+                      android:layout_marginEnd="16dp" />
+                  <include android:id="@+id/tile1" layout="@layout/tile"
+                      android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1"
+                      android:layout_marginStart="16dp" />
+              </LinearLayout>
+
+              <TextView android:id="@+id/hint" android:layout_width="match_parent" android:layout_height="wrap_content"
+                  android:textColor="@color/muted" android:textSize="18sp" android:layout_marginBottom="16dp"
+                  android:visibility="gone" />
+
+              <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal">
+                  <Button android:id="@+id/btnAll" android:layout_width="0dp" android:layout_weight="1" android:layout_height="72dp"
+                      android:layout_marginEnd="16dp" android:background="@drawable/btn_primary" android:text="Alles aktualisieren"
+                      android:textColor="#FFFFFF" android:textSize="20sp" android:textAllCaps="false" />
+                  <Button android:id="@+id/btnCheck" android:layout_width="0dp" android:layout_weight="1" android:layout_height="72dp"
+                      android:layout_marginStart="16dp" android:background="@drawable/btn_secondary" android:text="Erneut prüfen"
+                      android:textColor="@color/text" android:textSize="20sp" android:textAllCaps="false" />
+              </LinearLayout>
+          </LinearLayout>
+          EOF_X
+          mkdir -p 'app/src/main/res/layout'
+          cat > 'app/src/main/res/layout/tile.xml' <<'EOF_X'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent" android:layout_height="match_parent"
+              android:orientation="vertical" android:padding="28dp"
+              android:background="@drawable/tile_bg" android:focusable="true" android:clickable="true">
+              <TextView android:id="@+id/name" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                  android:textColor="@color/text" android:textSize="28sp" android:textStyle="bold" />
+              <TextView android:id="@+id/version" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                  android:layout_marginTop="6dp" android:textColor="@color/muted" android:textSize="20sp" />
+              <View android:layout_width="1dp" android:layout_height="0dp" android:layout_weight="1" />
+              <TextView android:id="@+id/status" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                  android:paddingStart="16dp" android:paddingEnd="16dp" android:paddingTop="6dp" android:paddingBottom="6dp"
+                  android:textSize="18sp" />
+          </LinearLayout>
+          EOF_X
+          mkdir -p 'app/src/main/res/drawable'
+          cat > 'app/src/main/res/drawable/banner.xml' <<'EOF_X'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="320dp" android:height="180dp" android:viewportWidth="320" android:viewportHeight="180">
+              <path android:fillColor="#14161A" android:pathData="M0,0h320v180h-320z" />
+              <group android:translateX="112" android:translateY="42" android:scaleX="4" android:scaleY="4">
+                  <path android:fillColor="#378ADD" android:pathData="M17.65,6.35C16.2,4.9 14.21,4 12,4c-4.42,0 -7.99,3.58 -7.99,8s3.57,8 7.99,8c3.73,0 6.84,-2.55 7.73,-6h-2.08c-0.82,2.33 -3.04,4 -5.65,4 -3.31,0 -6,-2.69 -6,-6s2.69,-6 6,-6c1.66,0 3.14,0.69 4.22,1.78L13,11h7V4l-2.35,2.35z" />
+              </group>
+          </vector>
+          EOF_X
+          mkdir -p 'app/src/main/res/drawable'
+          cat > 'app/src/main/res/drawable/btn_primary.xml' <<'EOF_X'
+          <selector xmlns:android="http://schemas.android.com/apk/res/android">
+              <item android:state_focused="true">
+                  <shape><solid android:color="@color/accent" /><corners android:radius="12dp" />
+                      <stroke android:width="4dp" android:color="#FFFFFF" /></shape>
+              </item>
+              <item>
+                  <shape><solid android:color="@color/accent" /><corners android:radius="12dp" /></shape>
+              </item>
+          </selector>
+          EOF_X
+          mkdir -p 'app/src/main/res/drawable'
+          cat > 'app/src/main/res/drawable/btn_secondary.xml' <<'EOF_X'
+          <selector xmlns:android="http://schemas.android.com/apk/res/android">
+              <item android:state_focused="true">
+                  <shape><solid android:color="#2C2F36" /><corners android:radius="12dp" />
+                      <stroke android:width="4dp" android:color="@color/accent" /></shape>
+              </item>
+              <item>
+                  <shape><solid android:color="#00000000" /><corners android:radius="12dp" />
+                      <stroke android:width="1dp" android:color="#5F5E5A" /></shape>
+              </item>
+          </selector>
+          EOF_X
+          mkdir -p 'app/src/main/res/drawable'
+          cat > 'app/src/main/res/drawable/ic_launcher.xml' <<'EOF_X'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="96dp" android:height="96dp" android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#378ADD" android:pathData="M12,0a12,12 0 1,0 0.01,0z" />
+              <group android:scaleX="0.7" android:scaleY="0.7" android:pivotX="12" android:pivotY="12">
+                  <path android:fillColor="#FFFFFF" android:pathData="M17.65,6.35C16.2,4.9 14.21,4 12,4c-4.42,0 -7.99,3.58 -7.99,8s3.57,8 7.99,8c3.73,0 6.84,-2.55 7.73,-6h-2.08c-0.82,2.33 -3.04,4 -5.65,4 -3.31,0 -6,-2.69 -6,-6s2.69,-6 6,-6c1.66,0 3.14,0.69 4.22,1.78L13,11h7V4l-2.35,2.35z" />
+              </group>
+          </vector>
+          EOF_X
+          mkdir -p 'app/src/main/res/drawable'
+          cat > 'app/src/main/res/drawable/tile_bg.xml' <<'EOF_X'
+          <selector xmlns:android="http://schemas.android.com/apk/res/android">
+              <item android:state_focused="true">
+                  <shape><solid android:color="@color/tile" /><corners android:radius="16dp" />
+                      <stroke android:width="4dp" android:color="@color/accent" /></shape>
+              </item>
+              <item>
+                  <shape><solid android:color="@color/tile" /><corners android:radius="16dp" />
+                      <stroke android:width="1dp" android:color="#444441" /></shape>
+              </item>
+          </selector>
+          EOF_X
+          echo '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' | base64 -d > app/updater.jks
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - run: gradle assembleRelease
+        working-directory: src
+      - run: cp src/app/build/outputs/apk/release/app-release.apk updater.apk
+      - run: gh release create "v${{ github.run_number }}" updater.apk --repo "${{ github.repository }}" --title "Updater ${{ github.run_number }}" --latest
+        env:
+          GH_TOKEN: ${{ github.token }}
