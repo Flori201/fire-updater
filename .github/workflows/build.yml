@@ -1,6 +1,8 @@
 name: APK bauen
 on:
   push:
+    paths:
+      - '.github/workflows/build.yml'
   workflow_dispatch:
 permissions:
   contents: write
@@ -26,6 +28,8 @@ jobs:
           cat > 'app/build.gradle' <<'EOF_X'
           plugins { id 'com.android.application' version '8.5.2' }
 
+          def runNo = (System.getenv('GITHUB_RUN_NUMBER') ?: '1') as Integer
+
           android {
               namespace 'de.flori.updater'
               compileSdk 34
@@ -33,8 +37,8 @@ jobs:
                   applicationId 'de.flori.updater'
                   minSdk 22
                   targetSdk 30
-                  versionCode 1
-                  versionName '1.0'
+                  versionCode runNo
+                  versionName "${runNo}"
               }
               signingConfigs {
                   release {
@@ -63,6 +67,7 @@ jobs:
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
               <uses-feature android:name="android.software.leanback" android:required="false" />
               <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
               <queries>
@@ -119,7 +124,16 @@ jobs:
           cat > 'app/src/main/java/de/flori/updater/MainActivity.java' <<'EOF_X'
           package de.flori.updater;
 
+          import android.Manifest;
           import android.app.Activity;
+          import android.app.DownloadManager;
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.IntentFilter;
+          import android.content.pm.PackageManager;
+          import android.database.Cursor;
+          import android.os.Environment;
+          import java.io.File;
           import android.app.PendingIntent;
           import android.content.Intent;
           import android.content.pm.PackageInfo;
@@ -163,8 +177,13 @@ jobs:
 
               private final App[] apps = {
                       new App("Projectivy", "com.spocky.projengmenu", "spocky/miproja1", ".apk"),
-                      new App("SmartTube", "org.smarttube.stable", "yuliskov/SmartTube", "universal.apk")
+                      new App("SmartTube", "org.smarttube.stable", "yuliskov/SmartTube", "universal.apk"),
+                      new App("Updater", "de.flori.updater", "Flori201/fire-updater", "updater.apk")
               };
+
+              private static final String WALL_NAME = "platine-rot.mp4";
+              private static final String WALL_URL = "https://github.com/Flori201/fire-updater/raw/main/" + WALL_NAME;
+              private long wallDownloadId = -1;
 
               private final Handler ui = new Handler(Looper.getMainLooper());
               private final ArrayDeque<App> queue = new ArrayDeque<>();
@@ -179,7 +198,7 @@ jobs:
                   lastCheck = findViewById(R.id.lastCheck);
                   hint = findViewById(R.id.hint);
 
-                  int[] tileIds = {R.id.tile0, R.id.tile1};
+                  int[] tileIds = {R.id.tile0, R.id.tile1, R.id.tile2};
                   for (int i = 0; i < apps.length; i++) {
                       final App a = apps[i];
                       View tile = findViewById(tileIds[i]);
@@ -190,6 +209,8 @@ jobs:
                   }
                   findViewById(R.id.btnAll).setOnClickListener(v -> startUpdates(null));
                   findViewById(R.id.btnCheck).setOnClickListener(v -> check());
+                  findViewById(R.id.btnWall).setOnClickListener(v -> loadWallpaper());
+                  registerReceiver(wallDone, new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE));
                   findViewById(R.id.btnAll).requestFocus();
                   check();
               }
@@ -356,6 +377,57 @@ jobs:
                   }
               }
 
+              // ---------- Hintergrund ----------
+
+              private void loadWallpaper() {
+                  if (Build.VERSION.SDK_INT < 29 && Build.VERSION.SDK_INT >= 23
+                          && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, 1);
+                      return;
+                  }
+                  try {
+                      File old = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), WALL_NAME);
+                      if (old.exists()) old.delete();
+                      DownloadManager dm = (DownloadManager) getSystemService(DOWNLOAD_SERVICE);
+                      DownloadManager.Request r = new DownloadManager.Request(Uri.parse(WALL_URL));
+                      r.setTitle("Hintergrund");
+                      r.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, WALL_NAME);
+                      r.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+                      wallDownloadId = dm.enqueue(r);
+                      showHint("Hintergrund wird geladen …");
+                  } catch (Exception e) {
+                      showHint("Hintergrund konnte nicht geladen werden.");
+                  }
+              }
+
+              @Override
+              public void onRequestPermissionsResult(int code, String[] perms, int[] res) {
+                  if (code == 1 && res.length > 0 && res[0] == PackageManager.PERMISSION_GRANTED) loadWallpaper();
+                  else showHint("Ohne Speicher-Erlaubnis kann der Hintergrund nicht gespeichert werden.");
+              }
+
+              private final BroadcastReceiver wallDone = new BroadcastReceiver() {
+                  @Override
+                  public void onReceive(Context c, Intent i) {
+                      long id = i.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -2);
+                      if (id != wallDownloadId) return;
+                      DownloadManager dm = (DownloadManager) getSystemService(DOWNLOAD_SERVICE);
+                      boolean ok = false;
+                      try (Cursor cur = dm.query(new DownloadManager.Query().setFilterById(id))) {
+                          if (cur != null && cur.moveToFirst())
+                              ok = cur.getInt(cur.getColumnIndex(DownloadManager.COLUMN_STATUS)) == DownloadManager.STATUS_SUCCESSFUL;
+                      }
+                      showHint(ok ? "Fertig. In Projectivy unter Hintergrund den Ordner Download und " + WALL_NAME + " wählen."
+                                  : "Hintergrund konnte nicht geladen werden.");
+                  }
+              };
+
+              @Override
+              protected void onDestroy() {
+                  super.onDestroy();
+                  try { unregisterReceiver(wallDone); } catch (Exception ignored) { }
+              }
+
               // ---------- Hilfsfunktionen ----------
 
               private HttpURLConnection open(String url) throws Exception {
@@ -415,72 +487,6 @@ jobs:
               }
           }
           EOF_X
-          mkdir -p 'app/src/main/res/values'
-          cat > 'app/src/main/res/values/colors.xml' <<'EOF_X'
-          <resources>
-              <color name="bg">#14161A</color>
-              <color name="tile">#22252B</color>
-              <color name="text">#F1EFE8</color>
-              <color name="muted">#B4B2A9</color>
-              <color name="accent">#378ADD</color>
-          </resources>
-          EOF_X
-          mkdir -p 'app/src/main/res/layout'
-          cat > 'app/src/main/res/layout/activity_main.xml' <<'EOF_X'
-          <?xml version="1.0" encoding="utf-8"?>
-          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
-              android:layout_width="match_parent" android:layout_height="match_parent"
-              android:orientation="vertical" android:background="@color/bg" android:padding="48dp">
-
-              <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
-                  android:orientation="horizontal" android:gravity="center_vertical">
-                  <TextView android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content"
-                      android:text="Updater" android:textColor="@color/text" android:textSize="32sp" android:textStyle="bold" />
-                  <TextView android:id="@+id/lastCheck" android:layout_width="wrap_content" android:layout_height="wrap_content"
-                      android:textColor="@color/muted" android:textSize="18sp" />
-              </LinearLayout>
-
-              <LinearLayout android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1"
-                  android:orientation="horizontal" android:layout_marginTop="32dp" android:layout_marginBottom="32dp">
-                  <include android:id="@+id/tile0" layout="@layout/tile"
-                      android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1"
-                      android:layout_marginEnd="16dp" />
-                  <include android:id="@+id/tile1" layout="@layout/tile"
-                      android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1"
-                      android:layout_marginStart="16dp" />
-              </LinearLayout>
-
-              <TextView android:id="@+id/hint" android:layout_width="match_parent" android:layout_height="wrap_content"
-                  android:textColor="@color/muted" android:textSize="18sp" android:layout_marginBottom="16dp"
-                  android:visibility="gone" />
-
-              <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal">
-                  <Button android:id="@+id/btnAll" android:layout_width="0dp" android:layout_weight="1" android:layout_height="72dp"
-                      android:layout_marginEnd="16dp" android:background="@drawable/btn_primary" android:text="Alles aktualisieren"
-                      android:textColor="#FFFFFF" android:textSize="20sp" android:textAllCaps="false" />
-                  <Button android:id="@+id/btnCheck" android:layout_width="0dp" android:layout_weight="1" android:layout_height="72dp"
-                      android:layout_marginStart="16dp" android:background="@drawable/btn_secondary" android:text="Erneut prüfen"
-                      android:textColor="@color/text" android:textSize="20sp" android:textAllCaps="false" />
-              </LinearLayout>
-          </LinearLayout>
-          EOF_X
-          mkdir -p 'app/src/main/res/layout'
-          cat > 'app/src/main/res/layout/tile.xml' <<'EOF_X'
-          <?xml version="1.0" encoding="utf-8"?>
-          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
-              android:layout_width="match_parent" android:layout_height="match_parent"
-              android:orientation="vertical" android:padding="28dp"
-              android:background="@drawable/tile_bg" android:focusable="true" android:clickable="true">
-              <TextView android:id="@+id/name" android:layout_width="wrap_content" android:layout_height="wrap_content"
-                  android:textColor="@color/text" android:textSize="28sp" android:textStyle="bold" />
-              <TextView android:id="@+id/version" android:layout_width="wrap_content" android:layout_height="wrap_content"
-                  android:layout_marginTop="6dp" android:textColor="@color/muted" android:textSize="20sp" />
-              <View android:layout_width="1dp" android:layout_height="0dp" android:layout_weight="1" />
-              <TextView android:id="@+id/status" android:layout_width="wrap_content" android:layout_height="wrap_content"
-                  android:paddingStart="16dp" android:paddingEnd="16dp" android:paddingTop="6dp" android:paddingBottom="6dp"
-                  android:textSize="18sp" />
-          </LinearLayout>
-          EOF_X
           mkdir -p 'app/src/main/res/drawable'
           cat > 'app/src/main/res/drawable/banner.xml' <<'EOF_X'
           <vector xmlns:android="http://schemas.android.com/apk/res/android"
@@ -538,6 +544,78 @@ jobs:
                       <stroke android:width="1dp" android:color="#444441" /></shape>
               </item>
           </selector>
+          EOF_X
+          mkdir -p 'app/src/main/res/layout'
+          cat > 'app/src/main/res/layout/activity_main.xml' <<'EOF_X'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent" android:layout_height="match_parent"
+              android:orientation="vertical" android:background="@color/bg" android:padding="48dp">
+
+              <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                  android:orientation="horizontal" android:gravity="center_vertical">
+                  <TextView android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content"
+                      android:text="Updater" android:textColor="@color/text" android:textSize="32sp" android:textStyle="bold" />
+                  <TextView android:id="@+id/lastCheck" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                      android:textColor="@color/muted" android:textSize="18sp" />
+              </LinearLayout>
+
+              <LinearLayout android:layout_width="match_parent" android:layout_height="0dp" android:layout_weight="1"
+                  android:orientation="horizontal" android:layout_marginTop="32dp" android:layout_marginBottom="32dp">
+                  <include android:id="@+id/tile0" layout="@layout/tile"
+                      android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1"
+                      android:layout_marginEnd="16dp" />
+                  <include android:id="@+id/tile1" layout="@layout/tile"
+                      android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1"
+                      android:layout_marginStart="16dp" android:layout_marginEnd="16dp" />
+                  <include android:id="@+id/tile2" layout="@layout/tile"
+                      android:layout_width="0dp" android:layout_height="match_parent" android:layout_weight="1"
+                      android:layout_marginStart="16dp" />
+              </LinearLayout>
+
+              <TextView android:id="@+id/hint" android:layout_width="match_parent" android:layout_height="wrap_content"
+                  android:textColor="@color/muted" android:textSize="18sp" android:layout_marginBottom="16dp"
+                  android:visibility="gone" />
+
+              <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal">
+                  <Button android:id="@+id/btnAll" android:layout_width="0dp" android:layout_weight="1" android:layout_height="72dp"
+                      android:layout_marginEnd="16dp" android:background="@drawable/btn_primary" android:text="Alles aktualisieren"
+                      android:textColor="#FFFFFF" android:textSize="20sp" android:textAllCaps="false" />
+                  <Button android:id="@+id/btnWall" android:layout_width="0dp" android:layout_weight="1" android:layout_height="72dp"
+                      android:layout_marginStart="16dp" android:layout_marginEnd="16dp" android:background="@drawable/btn_secondary" android:text="Hintergrund laden"
+                      android:textColor="@color/text" android:textSize="20sp" android:textAllCaps="false" />
+                  <Button android:id="@+id/btnCheck" android:layout_width="0dp" android:layout_weight="1" android:layout_height="72dp"
+                      android:layout_marginStart="16dp" android:background="@drawable/btn_secondary" android:text="Erneut prüfen"
+                      android:textColor="@color/text" android:textSize="20sp" android:textAllCaps="false" />
+              </LinearLayout>
+          </LinearLayout>
+          EOF_X
+          mkdir -p 'app/src/main/res/layout'
+          cat > 'app/src/main/res/layout/tile.xml' <<'EOF_X'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent" android:layout_height="match_parent"
+              android:orientation="vertical" android:padding="28dp"
+              android:background="@drawable/tile_bg" android:focusable="true" android:clickable="true">
+              <TextView android:id="@+id/name" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                  android:textColor="@color/text" android:textSize="28sp" android:textStyle="bold" />
+              <TextView android:id="@+id/version" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                  android:layout_marginTop="6dp" android:textColor="@color/muted" android:textSize="20sp" />
+              <View android:layout_width="1dp" android:layout_height="0dp" android:layout_weight="1" />
+              <TextView android:id="@+id/status" android:layout_width="wrap_content" android:layout_height="wrap_content"
+                  android:paddingStart="16dp" android:paddingEnd="16dp" android:paddingTop="6dp" android:paddingBottom="6dp"
+                  android:textSize="18sp" />
+          </LinearLayout>
+          EOF_X
+          mkdir -p 'app/src/main/res/values'
+          cat > 'app/src/main/res/values/colors.xml' <<'EOF_X'
+          <resources>
+              <color name="bg">#14161A</color>
+              <color name="tile">#22252B</color>
+              <color name="text">#F1EFE8</color>
+              <color name="muted">#B4B2A9</color>
+              <color name="accent">#378ADD</color>
+          </resources>
           EOF_X
           echo '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' | base64 -d > app/updater.jks
       - uses: actions/setup-java@v4
